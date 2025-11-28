@@ -1,9 +1,0 @@
-# Игнорировать виртуальное окружение
-myenv/
-.gitignore
-todo.db
-
-# Игнорировать файлы кэша Python
-__pycache__/
-*.pyc
-*.pyo
