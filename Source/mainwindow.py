@@ -8,18 +8,20 @@ from draw_dialog import DrawDialog
 
 from PyQt6.QtCore import (
     Qt,
+    QLocale,
+    QEvent,
     QDate,
     QTimer,
     QSettings,
+    QSignalBlocker,
     QUrl,
     QSize,
 )
 from PyQt6.QtGui import (
     QAction,
     QDesktopServices,
-    QFont,
+    QKeySequence,
     QTextDocument,
-    QIcon,
 )
 from PyQt6.QtSql import QSqlQuery, QSqlTableModel
 from PyQt6.QtWidgets import (
@@ -29,7 +31,6 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QHBoxLayout,
     QTableView,
-    QToolBar,
     QLineEdit,
     QLabel,
     QPushButton,
@@ -43,12 +44,10 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QDialogButtonBox,
     QCheckBox,
-    QGroupBox,
     QStatusBar,
     QListWidget,
     QListWidgetItem,
     QSystemTrayIcon,
-    QStyle,
     QMenu,
     QStackedWidget,
     QScrollArea,
@@ -57,12 +56,16 @@ from PyQt6.QtWidgets import (
     QFrame,
     QTabWidget,
     QInputDialog,
+    QHeaderView,
+    QGridLayout,
 )
 
-from style import DARK_QSS
+from style import GlassOverview, STATUS_TONES, icon, set_interface_size, set_primary
 from db import connect_db, init_schema
 from delegates import (
     PriorityDelegate,
+    StatusDelegate,
+    TaskCardDelegate,
     ArchiveDelegate,
     TimeSpentDelegate,
     DurationDelegate,
@@ -81,6 +84,33 @@ from dialogs import (
 )
 
 
+class EmptyState(QWidget):
+    def __init__(self, symbol, title, description):
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(6)
+        center = Qt.AlignmentFlag.AlignHCenter
+        glyph = QLabel()
+        glyph.setObjectName("EmptyMark")
+        glyph.setFixedSize(46, 46)
+        glyph.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        glyph.setPixmap(icon(symbol, "accent").pixmap(QSize(23, 23)))
+        self.title = QLabel(title)
+        self.title.setObjectName("PanelTitle")
+        self.title.setAlignment(center)
+        self.description = QLabel(description)
+        self.description.setProperty("muted", True)
+        self.description.setWordWrap(True)
+        self.description.setAlignment(center)
+        layout.addStretch(1)
+        layout.addWidget(glyph, 0, center)
+        layout.addSpacing(5)
+        layout.addWidget(self.title)
+        layout.addWidget(self.description)
+        layout.addStretch(1)
+
+
 class TodoManager(QMainWindow):
     STATUSES = ["План", "В работе", "Готово", "Отложено"]
     PRIORITY_LABELS = {1: "Низкий", 2: "Средний", 3: "Высокий", 4: "Критический"}
@@ -92,7 +122,8 @@ class TodoManager(QMainWindow):
         super().__init__()
         self.setObjectName("MainWindow")
         self.setWindowTitle("To-Do Manager")
-        self.resize(1300, 800)
+        self.resize(1400, 850)
+        self.setWindowIcon(icon("mark", "accent"))
 
         self.settings = QSettings("TodoManagerCompany", "TodoManager")
 
@@ -100,7 +131,7 @@ class TodoManager(QMainWindow):
         init_schema()
 
         self.current_user_id = None
-        self.today_mode = False
+        self.today_mode = self.settings.value("behavior/auto_today", False, bool)
 
         if not self._authenticate():
             sys.exit(0)
@@ -111,7 +142,7 @@ class TodoManager(QMainWindow):
         self._setup_headers()
 
         self._build_main_ui()
-        self.setStyleSheet(DARK_QSS)
+        self._apply_view_settings()
         self._install_hotkeys()
 
         self.refresh_view()
@@ -127,9 +158,7 @@ class TodoManager(QMainWindow):
         self.timer_elapsed = 0
 
         self.tray = QSystemTrayIcon(self)
-        self.tray.setIcon(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_TitleBarMenuButton)
-        )
+        self.tray.setIcon(self.windowIcon())
         m = QMenu()
         ma = m.addAction("Показать")
         mq = m.addAction("Выход")
@@ -144,13 +173,8 @@ class TodoManager(QMainWindow):
         self.notify_timer.start()
         self.notified_ids = set()
 
-        if self.settings.value("behavior/auto_today", False, bool):
-            self.today_mode = True
-            self.btn_today_toggle.setChecked(True)
         if self.settings.value("behavior/auto_kanban", False, bool):
             self._show_kanban_page()
-        else:
-            self._show_main_page()
 
     def _authenticate(self) -> bool:
         dlg = LoginDialog(self)
@@ -160,9 +184,20 @@ class TodoManager(QMainWindow):
         return False
 
     def _hide_internal_columns(self):
-        visible = {1, 3, 4, 5, 8}
+        width = self.table.width() - 12
+        title_width = max(143, self.table.fontMetrics().horizontalAdvance("Название") + 50)
+        visible = {1}
+        for col, column_width in self.table_column_widths.items():
+            if width - column_width >= title_width:
+                width -= column_width
+                visible.add(col)
         for col in range(self.model.columnCount()):
             self.table.setColumnHidden(col, col not in visible)
+
+    def eventFilter(self, watched, event):
+        if watched is self.table and event.type() == QEvent.Type.Resize:
+            self._hide_internal_columns()
+        return super().eventFilter(watched, event)
 
     def _setup_headers(self):
         headers = [
@@ -188,257 +223,322 @@ class TodoManager(QMainWindow):
 
     def _build_main_ui(self):
         central = QWidget()
+        central.setObjectName("Workspace")
         self.setCentralWidget(central)
-        root = QVBoxLayout(central)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
-
-        self._build_today_panel(root)
-
-        main_h = QHBoxLayout()
-        main_h.setContentsMargins(0, 0, 0, 0)
-        main_h.setSpacing(0)
-        root.addLayout(main_h, 1)
+        shell = QHBoxLayout(central)
+        shell.setContentsMargins(16, 16, 16, 12)
+        shell.setSpacing(16)
 
         self.stack = QStackedWidget()
         self.page_main = QWidget()
         self.page_kanban = QWidget()
-        self.page_dummy_stats = QWidget()
-
         self.stack.addWidget(self.page_main)
         self.stack.addWidget(self.page_kanban)
-        self.stack.addWidget(self.page_dummy_stats)
 
         self.left_nav = self._build_left_nav()
+        shell.addWidget(self.left_nav)
 
-        main_h.addWidget(self.left_nav)
-        main_h.addWidget(self.stack, 1)
+        workspace = QVBoxLayout()
+        workspace.setSpacing(14)
+        shell.addLayout(workspace, 1)
 
+        top = QHBoxLayout()
+        title = QVBoxLayout()
+        title.setSpacing(2)
+        self.workspace_title = QLabel("Задачи")
+        self.workspace_title.setObjectName("WorkspaceTitle")
+        self.lbl_today_title = QLabel()
+        self.lbl_today_title.setProperty("muted", True)
+        title.addWidget(self.workspace_title)
+        title.addWidget(self.lbl_today_title)
+        top.addLayout(title)
+        top.addStretch(1)
+        self._build_toolbar(top)
+        workspace.addLayout(top)
+
+        self._build_today_panel(workspace)
+        workspace.addWidget(self.stack, 1)
         self._build_main_page()
-
         self._build_kanban_page()
-
-        self._build_toolbar()
 
         self.statusbar = QStatusBar()
         self.setStatusBar(self.statusbar)
-
-        self._build_timer_panel(root)
-
+        self._build_timer_panel(workspace)
         self._update_left_nav_buttons()
 
     def _build_today_panel(self, parent_layout: QVBoxLayout):
-        grp = QGroupBox()
-        grp.setTitle("")
-        hl = QHBoxLayout(grp)
-        hl.setContentsMargins(12, 6, 12, 6)
-        hl.setSpacing(12)
+        overview = GlassOverview()
+        overview.setObjectName("Overview")
+        row = QHBoxLayout(overview)
+        row.setContentsMargins(20, 15, 16, 15)
+        row.setSpacing(16)
 
-        self.lbl_today_title = QLabel()
-        f = QFont()
-        f.setPointSize(16)
-        f.setBold(True)
-        self.lbl_today_title.setFont(f)
+        self.lbl_today_count = QLabel()
+        self.lbl_overdue_count = QLabel()
+        self.lbl_time_total = QLabel()
+        for caption, value, tone in (
+            ("На сегодня", self.lbl_today_count, "accent"),
+            ("Просрочено", self.lbl_overdue_count, "rose"),
+            ("Время по таймеру", self.lbl_time_total, "teal"),
+        ):
+            metric = QVBoxLayout()
+            metric.setSpacing(1)
+            label = QLabel(caption)
+            label.setObjectName("MetricLabel")
+            value.setObjectName("MetricValue")
+            value.setProperty("tone", tone)
+            metric.addWidget(label)
+            metric.addWidget(value)
+            row.addLayout(metric)
+            row.addSpacing(6)
 
-        self.lbl_today_stats = QLabel()
-        self.btn_focus = QPushButton("Начать фокус-сессию")
-        self.btn_today_toggle = QPushButton("Сегодня")
-        self.btn_today_toggle.setCheckable(True)
-
-        hl.addWidget(self.lbl_today_title)
-        hl.addSpacing(16)
-        hl.addWidget(self.lbl_today_stats)
-        hl.addStretch(1)
-        hl.addWidget(self.btn_focus)
-        hl.addWidget(self.btn_today_toggle)
-
-        parent_layout.addWidget(grp)
-
-        self.btn_today_toggle.toggled.connect(self._toggle_today_view)
+        row.addStretch(1)
+        self.btn_focus = QPushButton(icon("focus"), "Фокус-сессия")
+        self.btn_focus.setToolTip("Показать задачи на сегодня и задачи в работе")
         self.btn_focus.clicked.connect(self._start_focus_session)
-        self._update_today_panel()
+        row.addWidget(self.btn_focus)
+        parent_layout.addWidget(overview)
 
     def _build_left_nav(self):
         frame = QFrame()
         frame.setObjectName("LeftNav")
-        frame.setMinimumWidth(220)
+        frame.setFixedWidth(194)
         v = QVBoxLayout(frame)
-        v.setContentsMargins(10, 10, 10, 10)
-        v.setSpacing(8)
+        v.setContentsMargins(12, 15, 12, 11)
+        v.setSpacing(5)
 
-        def mk_btn(text: str, checkable: bool = True):
-            b = QPushButton(text)
-            b.setCheckable(checkable)
-            b.setProperty("LeftNavButton", True)
-            return b
+        brand = QHBoxLayout()
+        brand.setContentsMargins(3, 0, 3, 0)
+        brand.setSpacing(9)
+        mark = QLabel()
+        mark.setObjectName("BrandMark")
+        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        mark.setFixedSize(34, 34)
+        mark.setPixmap(icon("mark", "accent_hover").pixmap(QSize(23, 23)))
+        brand_title = QLabel("To-Do Manager")
+        brand_title.setObjectName("BrandTitle")
+        brand.addWidget(mark)
+        brand.addWidget(brand_title, 1)
+        v.addLayout(brand)
+        v.addSpacing(18)
 
-        self.btn_nav_list = mk_btn("Список задач")
-        self.btn_nav_kanban = mk_btn("Канбан")
-        self.btn_nav_today = mk_btn("Сегодня (фильтр)")
-        self.btn_nav_stats = mk_btn("Статистика", checkable=False)
-        self.btn_nav_archive = mk_btn("Архив")
+        self.btn_nav_list = QPushButton(icon("list"), "Задачи")
+        self.btn_nav_kanban = QPushButton(icon("board"), "Канбан")
+        self.btn_nav_today = QPushButton(icon("today"), "Сегодня")
+        self.btn_nav_archive = QPushButton(icon("archive"), "Архив")
+        self.btn_nav_stats = QPushButton(icon("chart"), "Статистика")
+        for button in (self.btn_nav_list, self.btn_nav_today, self.btn_nav_kanban, self.btn_nav_archive, self.btn_nav_stats):
+            button.setProperty("variant", "nav")
+            button.setIconSize(QSize(18, 18))
+            v.addWidget(button)
 
-        v.addWidget(self.btn_nav_list)
-        v.addWidget(self.btn_nav_kanban)
-        v.addWidget(self.btn_nav_today)
-        v.addWidget(self.btn_nav_stats)
-        v.addWidget(self.btn_nav_archive)
+        for button in (self.btn_nav_list, self.btn_nav_kanban, self.btn_nav_today, self.btn_nav_archive):
+            button.setCheckable(True)
+        self.btn_nav_archive.setToolTip("Включить архивные задачи в список")
 
-        v.addSpacing(10)
-        v.addWidget(QLabel("Проекты"))
+        v.addSpacing(16)
+        project_header = QHBoxLayout()
+        project_label = QLabel("Проекты")
+        project_label.setObjectName("SectionTitle")
+        project_header.addWidget(project_label, 1)
+        projects = QPushButton(icon("plus"), "")
+        projects.setToolTip("Управление проектами")
+        projects.setAccessibleName(projects.toolTip())
+        projects.setProperty("variant", "nav")
+        projects.clicked.connect(self.manage_projects)
+        project_header.addWidget(projects)
+        v.addLayout(project_header)
+
         self.projects_list = QListWidget()
+        self.projects_list.setObjectName("ProjectsList")
+        self.projects_list.setAccessibleName("Проекты")
         v.addWidget(self.projects_list, 1)
+
+        rule = QFrame()
+        rule.setProperty("rule", True)
+        rule.setFixedHeight(1)
+        v.addWidget(rule)
+        self.sidebar_actions = v
 
         self.btn_nav_list.clicked.connect(self._show_main_page)
         self.btn_nav_kanban.clicked.connect(self._show_kanban_page)
-        self.btn_nav_today.toggled.connect(self._left_today_toggled)
+        self.btn_nav_today.clicked.connect(self._left_today_toggled)
+        self.btn_nav_archive.clicked.connect(self._left_archive_toggled)
         self.btn_nav_stats.clicked.connect(self._open_dashboard)
-        self.btn_nav_archive.toggled.connect(self._left_archive_toggled)
         self.projects_list.itemClicked.connect(self._left_project_clicked)
+        self.projects_list.itemActivated.connect(self._left_project_clicked)
 
         self._reload_projects_left()
         return frame
 
     def _build_main_page(self):
         layout = QVBoxLayout(self.page_main)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
+        layout.setContentsMargins(0, 0, 0, 0)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal, self.page_main)
-        layout.addWidget(splitter, 1)
+        self.splitter = QSplitter(Qt.Orientation.Horizontal, self.page_main)
+        self.splitter.setHandleWidth(11)
+        self.splitter.setChildrenCollapsible(False)
+        layout.addWidget(self.splitter, 1)
 
-        left_container = QWidget()
-        left_layout = QVBoxLayout(left_container)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(6)
+        self.task_list_panel = QFrame()
+        self.task_list_panel.setProperty("surface", "glass")
+        task_layout = QVBoxLayout(self.task_list_panel)
+        task_layout.setContentsMargins(14, 13, 14, 10)
+        task_layout.setSpacing(9)
 
-        search_line = QLineEdit()
-        search_line.setPlaceholderText(
-            "Поиск: текст, @тег, status:Готово priority:3 project:Общее >2025-01-10"
-        )
-        self.search = search_line
-        left_layout.addWidget(self.search)
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        self.search = QLineEdit()
+        self.search.setObjectName("TaskSearch")
+        self.search.setAccessibleName("Поиск задач")
+        self.search.setPlaceholderText("Поиск задач")
+        self.search.setToolTip("Текст, @тег, status:Готово, priority:3, project:Общее, >2025-01-10")
+        self.search.setClearButtonEnabled(True)
+        self.search.addAction(icon("search"), QLineEdit.ActionPosition.LeadingPosition)
+        actions.addWidget(self.search, 1)
 
-        filters_grp = QGroupBox("Фильтры")
-        fl = QHBoxLayout(filters_grp)
-        fl.setContentsMargins(10, 8, 10, 8)
-        fl.setSpacing(10)
+        self.view_mode_cb = QComboBox()
+        self.view_mode_cb.setAccessibleName("Вид задач")
+        self.view_mode_cb.addItem(icon("list"), "Таблица")
+        self.view_mode_cb.addItem(icon("board"), "Карточки")
+        actions.addWidget(self.view_mode_cb)
+        task_layout.addLayout(actions)
 
+        filters = QHBoxLayout()
+        filters.setSpacing(7)
         self.status_cb = QComboBox()
-        self.status_cb.addItems(["Все"] + self.STATUSES)
+        self.status_cb.setAccessibleName("Статус задачи")
+        self.status_cb.addItems(["Все статусы"] + self.STATUSES)
         self.project_cb = QComboBox()
-        self.project_cb.addItem("—", -1)
+        self.project_cb.setAccessibleName("Проект")
+        self.project_cb.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.project_cb.setMinimumContentsLength(8)
+        self.project_cb.addItem("Все проекты", -1)
         self._reload_projects_combo(self.project_cb)
         self.hide_arch = QCheckBox("Скрывать архив")
         self.hide_arch.setChecked(True)
-
-        fl.addWidget(QLabel("Статус:"))
-        fl.addWidget(self.status_cb)
-        fl.addWidget(QLabel("Проект:"))
-        fl.addWidget(self.project_cb)
-        fl.addStretch(1)
-        fl.addWidget(self.hide_arch)
-
-        left_layout.addWidget(filters_grp)
-
-        mode_h = QHBoxLayout()
-        self.view_mode_cb = QComboBox()
-        self.view_mode_cb.addItems(["Таблица", "Карточки"])
-        mode_h.addWidget(QLabel("Вид:"))
-        mode_h.addWidget(self.view_mode_cb)
-        mode_h.addStretch(1)
-        left_layout.addLayout(mode_h)
+        filters.addWidget(self.status_cb)
+        filters.addWidget(self.project_cb)
+        filters.addStretch(1)
+        filters.addWidget(self.hide_arch)
+        task_layout.addLayout(filters)
 
         self.table = QTableView()
+        self.table.setObjectName("TaskTable")
+        self.table.setAccessibleName("Таблица задач")
         self.table.setModel(self.model)
         self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableView.SelectionMode.SingleSelection)
         self.table.setSortingEnabled(True)
         self.table.setEditTriggers(QTableView.EditTrigger.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
-        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setShowGrid(False)
+        header = self.table.horizontalHeader()
+        header.setHighlightSections(False)
+        header.setDefaultAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        header.setMinimumSectionSize(44)
+        header.setDefaultSectionSize(96)
+        self.table_column_widths = {3: 94, 5: 100, 4: 105, 8: 95}
+        for column, width in self.table_column_widths.items():
+            header.resizeSection(column, width)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.verticalHeader().setVisible(False)
         self.table.doubleClicked.connect(self.open_detail_current)
 
         self.table.setItemDelegateForColumn(1, TitleDelegate(self.table))
         self.table.setItemDelegateForColumn(2, DescriptionDelegate(self.table))
+        self.table.setItemDelegateForColumn(3, StatusDelegate(self.table))
         self.table.setItemDelegateForColumn(4, PriorityDelegate(self.table))
         self.table.setItemDelegateForColumn(5, DeadlineDelegate(self.table))
         self.table.setItemDelegateForColumn(8, ProjectDelegate(self.table))
         self.table.setItemDelegateForColumn(9, DurationDelegate(self.table))
         self.table.setItemDelegateForColumn(10, ArchiveDelegate(self.table))
         self.table.setItemDelegateForColumn(14, TimeSpentDelegate(self.table))
-
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._table_context_menu)
 
         self.gallery = QListWidget()
+        self.gallery.setObjectName("TaskGallery")
+        self.gallery.setAccessibleName("Карточки задач")
         self.gallery.setViewMode(QListWidget.ViewMode.IconMode)
         self.gallery.setResizeMode(QListWidget.ResizeMode.Adjust)
         self.gallery.setMovement(QListWidget.Movement.Static)
-        self.gallery.setIconSize(QSize(0, 0))
-        self.gallery.itemDoubleClicked.connect(self._open_detail_from_gallery)
+        self.gallery.setSpacing(4)
+        self.gallery.setItemDelegate(TaskCardDelegate(self.gallery))
+        self.gallery.currentItemChanged.connect(self._open_detail_from_gallery)
+        self.gallery.itemDoubleClicked.connect(self.open_detail_current)
         self.gallery.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.gallery.customContextMenuRequested.connect(self._gallery_context_menu)
 
-        left_layout.addWidget(self.table, 1)
-        left_layout.addWidget(self.gallery, 1)
-        self.gallery.hide()
+        self.task_views = QStackedWidget()
+        self.empty_tasks = EmptyState("list", "Задач пока нет", "Создайте первую задачу.")
+        for view in (self.table, self.gallery, self.empty_tasks):
+            self.task_views.addWidget(view)
+        task_layout.addWidget(self.task_views, 1)
 
-        splitter.addWidget(left_container)
-
-        right_container = QWidget()
-        splitter.addWidget(right_container)
-        splitter.setStretchFactor(0, 6)
-        splitter.setStretchFactor(1, 4)
-
-        self._build_detail_panel(right_container)
+        self.detail_panel = QFrame()
+        self.detail_panel.setProperty("surface", "glass")
+        self.detail_panel.setMinimumWidth(272)
+        self._build_detail_panel(self.detail_panel)
+        self.splitter.addWidget(self.task_list_panel)
+        self.splitter.addWidget(self.detail_panel)
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 0)
+        self.splitter.setSizes([680, 340])
 
         self.search.returnPressed.connect(self.apply_filter)
         self.search.textChanged.connect(self.apply_filter)
-        self.status_cb.currentTextChanged.connect(self.apply_filter)
+        self.status_cb.currentIndexChanged.connect(self.apply_filter)
         self.project_cb.currentIndexChanged.connect(self.apply_filter)
         self.hide_arch.toggled.connect(self.apply_filter)
         self.view_mode_cb.currentIndexChanged.connect(self._switch_view_mode)
-
-        self.table.selectionModel().selectionChanged.connect(
-            self._table_selection_changed
-        )
-
+        self.table.selectionModel().currentRowChanged.connect(self._table_selection_changed)
+        self.table.installEventFilter(self)
         self._hide_internal_columns()
 
     def _build_detail_panel(self, container: QWidget):
         v = QVBoxLayout(container)
-        v.setContentsMargins(8, 8, 8, 8)
-        v.setSpacing(6)
+        v.setContentsMargins(14, 14, 14, 12)
+        v.setSpacing(10)
 
-        hb = QHBoxLayout()
-        self.btn_history = QPushButton("История")
-        self.btn_full = QPushButton("Доп. параметры…")
-        self.btn_save = QPushButton("Сохранить")
-        self.btn_expand = QPushButton("Развернуть деталь")
-        hb.addWidget(self.btn_expand)
-        hb.addStretch(1)
-        hb.addWidget(self.btn_history)
-        hb.addWidget(self.btn_full)
-        hb.addWidget(self.btn_save)
-        v.addLayout(hb)
+        top = QHBoxLayout()
+        title = QLabel("Детали задачи")
+        title.setObjectName("PanelTitle")
+        self.btn_expand = QPushButton(icon("expand"), "")
+        self.btn_expand.setToolTip("Развернуть панель задачи")
+        self.btn_expand.setAccessibleName(self.btn_expand.toolTip())
+        self.btn_expand.clicked.connect(self._toggle_expand_detail)
+        top.addWidget(title)
+        top.addStretch(1)
+        top.addWidget(self.btn_expand)
+        v.addLayout(top)
 
+        self.detail_views = QStackedWidget()
+        self.detail_empty = EmptyState("template", "Выберите задачу", "Здесь появятся описание, подзадачи и вложения.")
+        self.detail_views.addWidget(self.detail_empty)
+        v.addWidget(self.detail_views, 1)
+
+        self.detail_content = QWidget()
+        detail_layout = QVBoxLayout(self.detail_content)
+        detail_layout.setContentsMargins(0, 0, 0, 0)
+        detail_layout.setSpacing(7)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        v.addWidget(scroll, 1)
+        detail_layout.addWidget(scroll, 1)
+        self.detail_views.addWidget(self.detail_content)
 
-        container_inner = QWidget()
-        scroll.setWidget(container_inner)
-        lay = QVBoxLayout(container_inner)
-        lay.setContentsMargins(12, 12, 12, 12)
-        lay.setSpacing(12)
+        body = QWidget()
+        body.setObjectName("DetailBody")
+        scroll.setWidget(body)
+        body.setAutoFillBackground(False)
+        scroll.viewport().setAutoFillBackground(False)
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(0, 0, 3, 4)
+        lay.setSpacing(8)
 
         self.detail_title = QLineEdit()
-        f = QFont()
-        f.setPointSize(20)
-        f.setBold(True)
-        self.detail_title.setFont(f)
+        self.detail_title.setObjectName("DetailTitle")
+        self.detail_title.setAccessibleName("Название задачи")
         lay.addWidget(self.detail_title)
 
         self.lbl_status = QLabel()
@@ -451,55 +551,81 @@ class TodoManager(QMainWindow):
         self.lbl_arch = QLabel()
         self.lbl_spent = QLabel()
 
-        for lab in [
-            self.lbl_status,
-            self.lbl_priority,
-            self.lbl_deadline,
-            self.lbl_soft,
-            self.lbl_tags,
-            self.lbl_project,
-            self.lbl_duration,
-            self.lbl_arch,
-            self.lbl_spent,
-        ]:
-            h = QHBoxLayout()
-            h.addWidget(lab)
-            h.addStretch(1)
-            lay.addLayout(h)
+        meta = QGridLayout()
+        meta.setHorizontalSpacing(10)
+        meta.setVerticalSpacing(5)
+        fields = (
+            ("Статус", self.lbl_status), ("Приоритет", self.lbl_priority),
+            ("Дедлайн", self.lbl_deadline), ("Мягкий срок", self.lbl_soft),
+            ("Проект", self.lbl_project), ("Теги", self.lbl_tags),
+            ("Оценка", self.lbl_duration), ("Таймер", self.lbl_spent),
+            ("В архиве", self.lbl_arch),
+        )
+        for index, (caption, value) in enumerate(fields):
+            field = QVBoxLayout()
+            field.setSpacing(1)
+            label = QLabel(caption)
+            label.setProperty("muted", True)
+            value.setWordWrap(True)
+            value.setTextFormat(Qt.TextFormat.PlainText)
+            field.addWidget(label)
+            field.addWidget(value)
+            meta.addLayout(field, index // 2, index % 2)
+        meta.setColumnStretch(0, 1)
+        meta.setColumnStretch(1, 1)
+        lay.addLayout(meta)
 
+        caption = QLabel("Описание")
+        caption.setObjectName("SectionTitle")
+        lay.addWidget(caption)
         self.detail_desc = RichTextEdit()
-        self.detail_desc.setPlaceholderText("Описание задачи, ссылки, чек-листы…")
-        self.detail_desc.setMinimumHeight(200)
+        self.detail_desc.editor.setAccessibleName(caption.text())
+        self.detail_desc.setPlaceholderText("Добавьте описание")
+        self.detail_desc.setMinimumHeight(115)
         self.detail_desc.linkClicked.connect(self._handle_desc_link_clicked)
-        lay.addWidget(self.detail_desc, 1)
-
-        self.attach_panel = AttachmentsPanel()
-        lay.addWidget(self.attach_panel)
+        lay.addWidget(self.detail_desc)
 
         self.sub_panel = SubtasksPanel()
-        lay.addWidget(self.sub_panel)
+        self.attach_panel = AttachmentsPanel()
         self.notes_preview = NotesPreview()
+        lay.addWidget(self.sub_panel)
+        lay.addWidget(self.attach_panel)
         lay.addWidget(self.notes_preview)
 
-        self.btn_draw = QPushButton("Рисунок")
-        lay.addWidget(self.btn_draw)
+        self.btn_draw = QPushButton(icon("edit"), "Добавить рисунок")
         self.btn_draw.clicked.connect(self._detail_add_drawing)
+        lay.addWidget(self.btn_draw, 0, Qt.AlignmentFlag.AlignLeft)
+        lay.addStretch(1)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(6)
+        self.btn_history = QPushButton(icon("clock"), "")
+        self.btn_history.setAccessibleName("История изменений")
+        self.btn_history.setToolTip(self.btn_history.accessibleName())
+        self.btn_full = QPushButton("Параметры")
+        self.btn_save = QPushButton("Сохранить")
+        self.btn_save.setProperty("variant", "primary")
+        actions.addWidget(self.btn_history)
+        actions.addWidget(self.btn_full)
+        actions.addStretch(1)
+        actions.addWidget(self.btn_save)
+        detail_layout.addLayout(actions)
 
         self.btn_save.clicked.connect(self._save_detail)
         self.btn_full.clicked.connect(self._open_full_editor_from_detail)
-        self.btn_history.clicked.connect(self._open_history_for_current)
-        self.btn_expand.clicked.connect(self._toggle_expand_detail)
+        self.btn_history.clicked.connect(self._open_detail_history)
 
         self.attach_panel.add_b.clicked.connect(self._detail_add_attachment)
         self.attach_panel.del_b.clicked.connect(self._detail_del_attachment)
         self.attach_panel.list.itemDoubleClicked.connect(self._detail_open_attachment)
-
         self.sub_panel.add_b.clicked.connect(self._detail_add_subtask)
         self.sub_panel.del_b.clicked.connect(self._detail_del_subtask)
         self.sub_panel.toggle_b.clicked.connect(self._detail_toggle_subtask)
+        self.sub_panel.list.itemChanged.connect(self._detail_save_subtask_state)
 
         self.current_detail_task = None
         self.detail_expanded = False
+        self.btn_expand.setEnabled(False)
 
     def _detail_add_drawing(self):
         if not self.current_detail_task:
@@ -521,96 +647,108 @@ class TodoManager(QMainWindow):
             self._detail_reload_attachments()
 
     def _build_kanban_page(self):
-        w = self.page_kanban
-        v = QVBoxLayout(w)
-        v.setContentsMargins(8, 8, 8, 8)
-        v.setSpacing(6)
+        layout = QVBoxLayout(self.page_kanban)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
 
         top = QHBoxLayout()
-        self.btn_kanban_refresh = QPushButton("Обновить")
+        self.btn_kanban_refresh = QPushButton(icon("refresh"), "Обновить")
         top.addStretch(1)
         top.addWidget(self.btn_kanban_refresh)
-        v.addLayout(top)
+        layout.addLayout(top)
 
-        cols = QHBoxLayout()
-        cols.setSpacing(10)
-        v.addLayout(cols, 1)
+        columns = QHBoxLayout()
+        columns.setSpacing(9)
+        layout.addLayout(columns, 1)
 
         self.kanban_lists = {}
-        for st in self.STATUSES:
-            col_w = QFrame()
-            col_w.setObjectName("KanbanColumn")
-            col_l = QVBoxLayout(col_w)
-            col_l.setContentsMargins(8, 8, 8, 8)
-            col_l.setSpacing(6)
+        self.kanban_counts = {}
+        self.active_kanban_list = None
+        for status in self.STATUSES:
+            column = QFrame()
+            column.setObjectName("KanbanColumn")
+            column_layout = QVBoxLayout(column)
+            column_layout.setContentsMargins(8, 10, 8, 7)
+            column_layout.setSpacing(7)
 
-            lbl = QLabel(st)
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            heading = QHBoxLayout()
+            heading.setContentsMargins(3, 0, 3, 0)
+            label = QLabel(status)
+            label.setObjectName("SectionTitle")
+            label.setProperty("tone", STATUS_TONES[status])
+            count = QLabel("0")
+            count.setObjectName("ColumnCount")
+            count.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            heading.addWidget(label)
+            heading.addStretch(1)
+            heading.addWidget(count)
+            column_layout.addLayout(heading)
+            self.kanban_counts[status] = count
 
-            lst = KanbanListWidget(st, self)
-            lst.setObjectName("KanbanList")
+            cards = KanbanListWidget(status, self)
+            cards.setObjectName("KanbanList")
+            cards.setAccessibleName(status)
+            cards.setSpacing(4)
+            cards.setItemDelegate(TaskCardDelegate(cards))
+            column_layout.addWidget(cards, 1)
+            columns.addWidget(column, 1)
+            self.kanban_lists[status] = cards
 
-            col_l.addWidget(lbl)
-            col_l.addWidget(lst, 1)
-            cols.addWidget(col_w)
-            self.kanban_lists[st] = lst
-
-            lst.itemDoubleClicked.connect(self._open_detail_from_kanban)
-            lst.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-            lst.customContextMenuRequested.connect(
-                lambda pos, l=lst: self._kanban_context_menu(l, pos)
+            cards.currentItemChanged.connect(self._remember_kanban_list)
+            cards.itemClicked.connect(self._remember_kanban_list)
+            cards.itemDoubleClicked.connect(self._open_detail_from_kanban)
+            cards.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            cards.customContextMenuRequested.connect(
+                lambda pos, view=cards: self._kanban_context_menu(view, pos)
             )
 
         self.btn_kanban_refresh.clicked.connect(self._reload_kanban)
 
-    def _build_toolbar(self):
-        tb = QToolBar("Главная")
-        tb.setMovable(False)
-        self.addToolBar(tb)
+    def _build_toolbar(self, layout: QHBoxLayout):
+        for name, text, symbol, callback in (
+            ("act_add", "Новая задача", "plus", self.add_task),
+            ("act_edit_full", "Изменить задачу…", "edit", self._open_full_editor_from_list),
+            ("act_export", "Экспорт CSV…", "download", self.export_csv),
+            ("act_import", "Импорт CSV…", "upload", self.import_csv),
+            ("act_proj", "Управление проектами…", "folder", self.manage_projects),
+            ("act_tpl", "Шаблоны…", "template", self.open_templates),
+            ("act_dash", "Статистика", "chart", self._open_dashboard),
+            ("act_timer", "Старт таймера", "clock", self.toggle_timer),
+            ("act_logout", "Сменить профиль", "user", self.logout),
+            ("act_settings", "Настройки", "settings", self._open_settings),
+        ):
+            action = QAction(icon(symbol), text, self)
+            action.triggered.connect(callback)
+            setattr(self, name, action)
 
-        self.act_add = QAction("Добавить", self)
-        self.act_add.triggered.connect(self.add_task)
+        more = QPushButton(icon("more", "accent_hover"), "")
+        more.setObjectName("WorkspaceMenu")
+        more.setIconSize(QSize(20, 20))
+        more.setAccessibleName("Действия и данные")
+        more.setToolTip(more.accessibleName())
+        menu = QMenu(more)
+        menu.addAction(self.act_edit_full)
+        menu.addAction(self.act_timer)
+        menu.addSeparator()
+        menu.addAction(self.act_tpl)
+        menu.addAction(self.act_proj)
+        menu.addSeparator()
+        menu.addAction(self.act_import)
+        menu.addAction(self.act_export)
+        more.setMenu(menu)
+        layout.addWidget(more)
 
-        self.act_edit_full = QAction("Изменить…", self)
-        self.act_edit_full.triggered.connect(self._open_full_editor_from_list)
+        add = QPushButton(icon("plus", "on_accent"), self.act_add.text())
+        add.setProperty("variant", "primary")
+        add.setObjectName("AddTask")
+        add.clicked.connect(self.act_add.trigger)
+        layout.addWidget(add)
 
-        self.act_export = QAction("Экспорт CSV", self)
-        self.act_export.triggered.connect(self.export_csv)
-
-        self.act_import = QAction("Импорт CSV", self)
-        self.act_import.triggered.connect(self.import_csv)
-
-        self.act_proj = QAction("Проекты", self)
-        self.act_proj.triggered.connect(self.manage_projects)
-
-        self.act_tpl = QAction("Шаблоны", self)
-        self.act_tpl.triggered.connect(self.open_templates)
-
-        self.act_dash = QAction("Статистика", self)
-        self.act_dash.triggered.connect(self._open_dashboard)
-
-        self.act_timer = QAction("Старт таймера", self)
-        self.act_timer.triggered.connect(self.toggle_timer)
-
-        self.act_logout = QAction("Сменить пользователя", self)
-        self.act_logout.triggered.connect(self.logout)
-
-        self.act_settings = QAction("Настройки", self)
-        self.act_settings.triggered.connect(self._open_settings)
-
-        for a in [
-            self.act_add,
-            self.act_edit_full,
-            self.act_export,
-            self.act_import,
-            self.act_proj,
-            self.act_tpl,
-            self.act_dash,
-            self.act_timer,
-            self.act_settings,
-            self.act_logout,
-        ]:
-            tb.addAction(a)
+        for action in (self.act_settings, self.act_logout):
+            button = QPushButton(action.icon(), action.text())
+            button.setProperty("variant", "nav")
+            button.clicked.connect(action.trigger)
+            self.sidebar_actions.addWidget(button)
 
     def _build_timer_panel(self, root: QVBoxLayout):
         panel = QFrame()
@@ -620,7 +758,7 @@ class TodoManager(QMainWindow):
         hl.setSpacing(8)
 
         self.lbl_timer = QLabel("Таймер: не запущен")
-        self.btn_timer_stop = QPushButton("Стоп")
+        self.btn_timer_stop = QPushButton("Остановить")
         self.btn_timer_open = QPushButton("Открыть задачу")
 
         hl.addWidget(self.lbl_timer)
@@ -637,31 +775,33 @@ class TodoManager(QMainWindow):
 
     def _reload_projects_left(self):
         self.projects_list.clear()
-        it_all = QListWidgetItem("Все проекты")
+        it_all = QListWidgetItem(icon("folder"), "Все проекты")
         it_all.setData(Qt.ItemDataRole.UserRole, -1)
         self.projects_list.addItem(it_all)
         q = QSqlQuery("SELECT id, name FROM projects ORDER BY name")
         if q.exec():
             while q.next():
-                it = QListWidgetItem(q.value(1))
+                it = QListWidgetItem(icon("folder"), q.value(1))
                 it.setData(Qt.ItemDataRole.UserRole, int(q.value(0)))
                 self.projects_list.addItem(it)
 
     def _update_left_nav_buttons(self):
-        self.btn_nav_list.setChecked(self.stack.currentWidget() == self.page_main)
-        self.btn_nav_kanban.setChecked(self.stack.currentWidget() == self.page_kanban)
-        self.btn_nav_archive.setChecked(
-            not self.hide_arch.isChecked()
-        )
+        on_board = self.stack.currentWidget() == self.page_kanban
+        self.btn_nav_list.setChecked(not on_board and not self.today_mode)
+        self.btn_nav_today.setChecked(self.today_mode)
+        self.btn_nav_kanban.setChecked(on_board)
+        self.btn_nav_archive.setChecked(not self.hide_arch.isChecked())
+        self.workspace_title.setText("Канбан" if on_board else "Сегодня" if self.today_mode else "Задачи")
+        project = self.project_cb.currentData()
+        for row in range(self.projects_list.count()):
+            if self.projects_list.item(row).data(Qt.ItemDataRole.UserRole) == project:
+                self.projects_list.setCurrentRow(row)
+                break
 
     def _show_main_page(self):
         self.today_mode = False
-        self.btn_today_toggle.setChecked(False)
-        self.btn_nav_today.setChecked(False)
-
         self.stack.setCurrentWidget(self.page_main)
         self.apply_filter()
-        self._update_left_nav_buttons()
 
     def _show_kanban_page(self):
         self.stack.setCurrentWidget(self.page_kanban)
@@ -670,15 +810,15 @@ class TodoManager(QMainWindow):
 
     def _left_today_toggled(self, checked: bool):
         self.today_mode = checked
-        self.btn_today_toggle.setChecked(checked)
+        self.stack.setCurrentWidget(self.page_main)
         self.apply_filter()
 
     def _left_archive_toggled(self, checked: bool):
+        self.stack.setCurrentWidget(self.page_main)
         self.hide_arch.setChecked(not checked)
-        self.apply_filter()
-        self._update_left_nav_buttons()
 
     def _left_project_clicked(self, item: QListWidgetItem):
+        self.stack.setCurrentWidget(self.page_main)
         pid = item.data(Qt.ItemDataRole.UserRole)
         if pid == -1:
             self.project_cb.setCurrentIndex(0)
@@ -689,8 +829,10 @@ class TodoManager(QMainWindow):
         self.apply_filter()
 
     def _update_today_panel(self):
-        today_str = datetime.now().strftime("%d %B %Y")
-        self.lbl_today_title.setText(f"Сегодня, {today_str}")
+        date = QLocale(QLocale.Language.Russian).toString(
+            QDate.currentDate(), "dddd, d MMMM yyyy"
+        )
+        self.lbl_today_title.setText(date[:1].upper() + date[1:])
 
         today = datetime.now().strftime("%Y-%m-%d")
 
@@ -725,20 +867,12 @@ class TodoManager(QMainWindow):
         h = total_sec // 3600
         m = (total_sec % 3600) // 60
 
-        self.lbl_today_stats.setText(
-            f"На сегодня задач: {today_count} | Просрочено: {over} | Всего времени: {h} ч {m} мин"
-        )
-
-    def _toggle_today_view(self, checked: bool):
-        self.today_mode = bool(checked)
-        self.btn_nav_today.setChecked(checked)
-        self.apply_filter()
+        self.lbl_today_count.setText(str(today_count))
+        self.lbl_overdue_count.setText(str(over))
+        self.lbl_time_total.setText(f"{h} ч {m:02d} мин" if h else f"{m} мин")
 
     def _start_focus_session(self):
-        self.today_mode = True
-        self.btn_today_toggle.setChecked(True)
-        self.btn_nav_today.setChecked(True)
-        self.apply_filter()
+        self._left_today_toggled(True)
 
     def _reload_projects_combo(self, combo: QComboBox):
         combo.blockSignals(True)
@@ -763,10 +897,7 @@ class TodoManager(QMainWindow):
         self._reload_projects_combo(self.project_cb)
         self._reload_projects_left()
         self.apply_filter()
-        self._hide_internal_columns()
-        self._reload_gallery()
-        self._reload_kanban()
-        self._update_today_panel()
+        self._update_statusbar_stats()
 
     def _escape_like(self, s: str) -> str:
         return s.replace("'", "''")
@@ -819,7 +950,7 @@ class TodoManager(QMainWindow):
             clauses.append("archived = 0")
 
         status = self.status_cb.currentText()
-        if status and status != "Все":
+        if self.status_cb.currentIndex() > 0:
             clauses.append(f"status = '{self._escape_like(status)}'")
 
         pid = self.project_cb.currentData()
@@ -847,10 +978,10 @@ class TodoManager(QMainWindow):
 
         self.model.setFilter(" AND ".join(clauses))
         self.model.select()
-        self.table.resizeColumnsToContents()
         self._hide_internal_columns()
         self._reload_gallery()
         self._reload_kanban()
+        self._switch_view_mode(self.view_mode_cb.currentIndex())
         self._update_left_nav_buttons()
         self._update_today_panel()
 
@@ -880,7 +1011,8 @@ class TodoManager(QMainWindow):
                 doc = QTextDocument()
                 doc.setHtml(desc_html)
                 plain = doc.toPlainText()
-                desc = plain.strip().splitlines()[0] if plain else ""
+                lines = plain.strip().splitlines()
+                desc = lines[0] if lines else ""
                 if len(desc) > 80:
                     desc = desc[:77] + "..."
 
@@ -890,30 +1022,60 @@ class TodoManager(QMainWindow):
                 if dl:
                     line2 += f" • {dl}"
                 if self._task_has_attachments(tid):
-                    line2 += " • 📎"
+                    line2 += " · Вложения"
 
-
-                text = f"{line1}\n{line2}\n{desc}"
-                it = QListWidgetItem(text)
+                it = QListWidgetItem(f"{line1}\n{line2}\n{desc}")
                 it.setData(Qt.ItemDataRole.UserRole, tid)
-                it.setSizeHint(QSize(240, 80))
+                it.setData(TaskCardDelegate.CONTENT, (title, line2, desc, STATUS_TONES.get(status, "accent")))
+                it.setToolTip(title)
+                it.setSizeHint(QSize(250, 97))
                 self.gallery.addItem(it)
 
     def _switch_view_mode(self, idx: int):
-        if idx == 0:
-            self.table.show()
-            self.gallery.hide()
-        else:
-            self.gallery.show()
-            self.table.hide()
+        if self.gallery.count():
+            view = self.table if idx == 0 else self.gallery
+            previous = self.task_views.currentWidget()
+            self.task_views.setCurrentWidget(view)
+            if previous is not view and previous is not self.empty_tasks and self.current_detail_task:
+                self._select_task_in_view(self.current_detail_task)
+            return
+        filtered = bool(
+            self.search.text().strip() or self.today_mode
+            or self.status_cb.currentIndex() > 0 or self.project_cb.currentIndex() > 0
+        )
+        self.empty_tasks.title.setText("Задачи не найдены" if filtered else "Задач пока нет")
+        self.empty_tasks.description.setText(
+            "Измените запрос или фильтры." if filtered else "Создайте первую задачу."
+        )
+        self.task_views.setCurrentWidget(self.empty_tasks)
 
     def _current_task_id(self):
+        if self.stack.currentWidget() == self.page_kanban:
+            view = next(
+                (cards for cards in self.kanban_lists.values() if cards.hasFocus()),
+                self.active_kanban_list,
+            )
+            return self._card_task_id(view.currentItem()) if view else None
+        if self.detail_expanded:
+            return self.current_detail_task
+        view = self.task_views.currentWidget()
+        if view is self.gallery:
+            return self._card_task_id(self.gallery.currentItem())
+        if view is self.table:
+            return self._table_task_id()
+        return None
+
+    def _table_task_id(self):
         idx = self.table.currentIndex()
         if not idx.isValid():
             return None
         row = idx.row()
         val = self.model.data(self.model.index(row, 0))
         return int(val) if val is not None else None
+
+    @staticmethod
+    def _card_task_id(item):
+        return int(item.data(Qt.ItemDataRole.UserRole)) if item else None
 
     def _display_number_for_task(self, tid: int):
         try:
@@ -930,15 +1092,33 @@ class TodoManager(QMainWindow):
         return tid
 
     def _table_selection_changed(self, *_):
-        tid = self._current_task_id()
-        if tid:
-            self._open_detail(tid)
+        if self.stack.currentWidget() == self.page_main and self.task_views.currentWidget() == self.table:
+            tid = self._table_task_id()
+            if tid:
+                self._open_detail(tid)
 
     def open_detail_current(self):
         tid = self._current_task_id()
-        if not tid:
-            return
+        if tid:
+            if self.stack.currentWidget() == self.page_kanban:
+                self._show_task_in_workspace(tid)
+            else:
+                self._open_detail(tid)
+
+    def _show_task_in_workspace(self, tid):
+        self._show_main_page()
+        self._select_task_in_view(tid)
         self._open_detail(tid)
+
+    def _select_task_in_view(self, tid):
+        if self.task_views.currentWidget() is self.gallery:
+            for row in range(self.gallery.count()):
+                item = self.gallery.item(row)
+                if self._card_task_id(item) == tid:
+                    self.gallery.setCurrentItem(item)
+                    break
+        else:
+            self._select_task_in_table(tid)
 
     def _format_minutes(self, minutes):
         try:
@@ -963,7 +1143,6 @@ class TodoManager(QMainWindow):
             return "0 мин"
 
     def _open_detail(self, task_id):
-        self.current_detail_task = int(task_id)
         q = QSqlQuery()
         q.prepare(
             "SELECT title, description, status, priority, deadline, soft_deadline, "
@@ -972,29 +1151,20 @@ class TodoManager(QMainWindow):
         )
         q.addBindValue(int(task_id))
         q.addBindValue(int(self.current_user_id))
-        title = ""
-        desc = ""
-        st = "План"
-        pr = 2
-        dl = None
-        sdl = None
-        tags = ""
-        pid = None
-        dur = 0
-        arch = 0
-        spent = 0
-        if q.exec() and q.next():
-            title = q.value(0) or ""
-            desc = q.value(1) or ""
-            st = q.value(2) or "План"
-            pr = int(q.value(3) or 2)
-            dl = q.value(4)
-            sdl = q.value(5)
-            tags = q.value(6) or ""
-            pid = q.value(7)
-            dur = int(q.value(8) or 0)
-            arch = int(q.value(9) or 0)
-            spent = int(q.value(10) or 0)
+        if not q.exec() or not q.next():
+            return
+        self.current_detail_task = int(task_id)
+        title = q.value(0) or ""
+        desc = q.value(1) or ""
+        st = q.value(2) or "План"
+        pr = int(q.value(3) or 2)
+        dl = q.value(4)
+        sdl = q.value(5)
+        tags = q.value(6) or ""
+        pid = q.value(7)
+        dur = int(q.value(8) or 0)
+        arch = int(q.value(9) or 0)
+        spent = int(q.value(10) or 0)
 
         pname = "—"
         if pid:
@@ -1005,17 +1175,17 @@ class TodoManager(QMainWindow):
                 pname = qp.value(0) or "—"
 
         self.detail_title.setText(title)
-        self.lbl_status.setText(f"Статус — {st}")
-        self.lbl_priority.setText(f"Приоритет — {PriorityDelegate.MAP.get(pr, '')}")
-        self.lbl_deadline.setText(f"Дедлайн — {dl or '—'}")
-        self.lbl_soft.setText(f"Мягкий срок — {sdl or '—'}")
-        self.lbl_tags.setText(f"Теги — {tags or '—'}")
-        self.lbl_project.setText(f"Проект — {pname}")
-        self.lbl_duration.setText(
-            f"Оценка длительности — {self._format_minutes(dur)}"
-        )
-        self.lbl_arch.setText(f"Архив — {'+' if arch else '-'}")
-        self.lbl_spent.setText(f"Время — {self._format_seconds(spent)}")
+        self.detail_title.setCursorPosition(0)
+        self.detail_title.setToolTip(title)
+        self.lbl_status.setText(st)
+        self.lbl_priority.setText(PriorityDelegate.MAP.get(pr, "—"))
+        self.lbl_deadline.setText(dl or "—")
+        self.lbl_soft.setText(sdl or "—")
+        self.lbl_tags.setText(tags or "—")
+        self.lbl_project.setText(pname)
+        self.lbl_duration.setText(self._format_minutes(dur))
+        self.lbl_arch.setText("Да" if arch else "Нет")
+        self.lbl_spent.setText(self._format_seconds(spent))
 
         self.detail_desc.blockSignals(True)
         self.detail_desc.setHtml(desc if desc else "")
@@ -1023,7 +1193,8 @@ class TodoManager(QMainWindow):
 
         self._detail_reload_attachments()
         self._detail_reload_subtasks()
-        self.notes_preview.load_for_task(int(task_id))
+        self.detail_views.setCurrentWidget(self.detail_content)
+        self.btn_expand.setEnabled(True)
 
     def _save_detail(self):
         if not self.current_detail_task:
@@ -1050,6 +1221,19 @@ class TodoManager(QMainWindow):
 
     def _toggle_expand_detail(self):
         self.detail_expanded = not self.detail_expanded
+        self.task_list_panel.setVisible(not self.detail_expanded)
+        symbol = "collapse" if self.detail_expanded else "expand"
+        label = "Вернуть список задач" if self.detail_expanded else "Развернуть панель задачи"
+        self.btn_expand.setIcon(icon(symbol))
+        self.btn_expand.setToolTip(label)
+        self.btn_expand.setAccessibleName(label)
+
+    def _reset_detail(self):
+        if self.detail_expanded:
+            self._toggle_expand_detail()
+        self.current_detail_task = None
+        self.detail_views.setCurrentWidget(self.detail_empty)
+        self.btn_expand.setEnabled(False)
 
     def _handle_desc_link_clicked(self, href: str):
         try:
@@ -1091,6 +1275,7 @@ class TodoManager(QMainWindow):
                 it = QListWidgetItem(name)
                 it.setData(Qt.ItemDataRole.UserRole, aid)
                 self.attach_panel.list.addItem(it)
+        self.notes_preview.load_for_task(self.current_detail_task)
 
     def _detail_add_attachment(self):
         if not self.current_detail_task:
@@ -1186,23 +1371,29 @@ class TodoManager(QMainWindow):
             self._auto_progress_from_subtasks(self.current_detail_task)
 
     def _detail_toggle_subtask(self):
-        it = self.sub_panel.list.currentItem()
-        if not it:
+        item = self.sub_panel.list.currentItem()
+        if item:
+            item.setCheckState(
+                Qt.CheckState.Unchecked if item.checkState() == Qt.CheckState.Checked
+                else Qt.CheckState.Checked
+            )
+
+    def _detail_save_subtask_state(self, item):
+        if not self.current_detail_task:
             return
-        sid = int(it.data(Qt.ItemDataRole.UserRole))
-        done = (
-            1
-            if it.checkState() != Qt.CheckState.Checked
-            else 0
-        )
+        sid = int(item.data(Qt.ItemDataRole.UserRole))
+        done = item.checkState() == Qt.CheckState.Checked
         q = QSqlQuery()
-        q.prepare("UPDATE subtasks SET done=? WHERE id=?")
-        q.addBindValue(done)
+        q.prepare("UPDATE subtasks SET done=? WHERE id=? AND task_id=?")
+        q.addBindValue(int(done))
         q.addBindValue(sid)
-        q.exec()
-        self._detail_reload_subtasks()
-        if self.current_detail_task:
+        q.addBindValue(int(self.current_detail_task))
+        if q.exec():
             self._auto_progress_from_subtasks(self.current_detail_task)
+        else:
+            with QSignalBlocker(self.sub_panel.list):
+                item.setCheckState(Qt.CheckState.Unchecked if done else Qt.CheckState.Checked)
+            QMessageBox.warning(self, "Подзадача", "Не удалось обновить статус подзадачи")
 
     def _last_insert_rowid(self):
         q = QSqlQuery("SELECT last_insert_rowid()")
@@ -1229,12 +1420,19 @@ class TodoManager(QMainWindow):
 
     def _open_full_editor(self, task_id=None, preset_title=""):
         dlg = QDialog(self)
-        dlg.setWindowTitle("Задача — параметры")
-        form = QFormLayout(dlg)
+        dlg.setWindowTitle("Редактирование задачи" if task_id else "Новая задача")
+        dlg.resize(760, 500)
+        root = QVBoxLayout(dlg)
+        root.setContentsMargins(22, 20, 22, 18)
+        root.setSpacing(14)
+        heading = QLabel(dlg.windowTitle())
+        heading.setObjectName("DialogTitle")
+        root.addWidget(heading)
 
         e_title = QLineEdit()
         e_title.setText(preset_title)
         e_desc = QTextEdit()
+        e_desc.setPlaceholderText("Добавьте описание")
         cb_status = QComboBox()
         cb_status.addItems(self.STATUSES)
         cb_pr = QComboBox()
@@ -1297,24 +1495,49 @@ class TodoManager(QMainWindow):
                     rec_idx = 0
                 cb_recur.setCurrentIndex(rec_idx)
 
-        form.addRow("Название", e_title)
-        form.addRow("Описание", e_desc)
+        columns = QHBoxLayout()
+        columns.setSpacing(18)
+        root.addLayout(columns, 1)
+        body = QVBoxLayout()
+        body.setSpacing(7)
+        name_label = QLabel("Название")
+        name_label.setBuddy(e_title)
+        description_label = QLabel("Описание")
+        description_label.setBuddy(e_desc)
+        body.addWidget(name_label)
+        body.addWidget(e_title)
+        body.addSpacing(5)
+        body.addWidget(description_label)
+        body.addWidget(e_desc, 1)
+        columns.addLayout(body, 5)
+
+        metadata = QFrame()
+        metadata.setProperty("surface", "glass")
+        form = QFormLayout(metadata)
+        form.setContentsMargins(14, 12, 14, 12)
+        form.setVerticalSpacing(6)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         form.addRow("Статус", cb_status)
         form.addRow("Приоритет", cb_pr)
         form.addRow("Дедлайн", d1)
         form.addRow("Мягкий срок", d2)
         form.addRow("Теги", e_tags)
         form.addRow("Проект", cb_proj)
-        form.addRow("Оценка длительности", sp_dur)
+        form.addRow("Оценка", sp_dur)
         form.addRow("Повторение", cb_recur)
-        form.addRow("Архив", ch_arch)
+        form.addRow(ch_arch)
+        columns.addWidget(metadata, 4)
 
         bb = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel,
             parent=dlg,
         )
-        form.addRow(bb)
+        primary = bb.button(QDialogButtonBox.StandardButton.Ok)
+        primary.setText("Сохранить" if task_id else "Создать задачу")
+        set_primary(primary)
+        bb.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
+        root.addWidget(bb)
         bb.accepted.connect(dlg.accept)
         bb.rejected.connect(dlg.reject)
 
@@ -1449,62 +1672,46 @@ class TodoManager(QMainWindow):
         return ""
 
     def _select_task_in_table(self, tid: int):
-        for row in range(self.model.rowCount()):
-            idx = self.model.index(row, 0)
-            val = self.model.data(idx)
-            try:
-                if int(val or 0) == int(tid):
+        start = 0
+        while True:
+            stop = self.model.rowCount()
+            for row in range(start, stop):
+                if self.model.data(self.model.index(row, 0)) == tid:
                     self.table.selectRow(row)
                     self.table.setCurrentIndex(self.model.index(row, 1))
-                    break
-            except Exception:
-                continue
+                    return True
+            if not self.model.canFetchMore():
+                return False
+            self.model.fetchMore()
+            if self.model.rowCount() == stop:
+                return False
+            start = stop
 
     def _table_context_menu(self, pos):
         index = self.table.indexAt(pos)
         if not index.isValid():
             return
+        self.table.setCurrentIndex(index)
         self.table.selectRow(index.row())
 
-        menu = QMenu(self)
-        menu.addAction("Открыть", self.open_detail_current)
-        menu.addAction(self.act_edit_full)
-        menu.addAction("История", self._open_history_for_current)
-        menu.addSeparator()
-        menu.addAction("Выполнено", self.mark_done)
-        menu.addAction("В архив", self.archive_task)
-        menu.addSeparator()
-        menu.addAction(self.act_timer)
-        menu.exec(self.table.viewport().mapToGlobal(pos))
+        self._show_task_menu(self.table.viewport().mapToGlobal(pos))
 
     def _gallery_context_menu(self, pos):
         item = self.gallery.itemAt(pos)
         if not item:
             return
-        tid = item.data(Qt.ItemDataRole.UserRole)
-        if not tid:
-            return
-        self._select_task_in_table(int(tid))
-        menu = QMenu(self)
-        menu.addAction("Открыть", self.open_detail_current)
-        menu.addAction(self.act_edit_full)
-        menu.addAction("История", self._open_history_for_current)
-        menu.addSeparator()
-        menu.addAction("Выполнено", self.mark_done)
-        menu.addAction("В архив", self.archive_task)
-        menu.addSeparator()
-        menu.addAction(self.act_timer)
-        menu.exec(self.gallery.viewport().mapToGlobal(pos))
+        self.gallery.setCurrentItem(item)
+        self._show_task_menu(self.gallery.viewport().mapToGlobal(pos))
 
     def _kanban_context_menu(self, lst: QListWidget, pos):
         item = lst.itemAt(pos)
         if not item:
             return
+        self.active_kanban_list = lst
         lst.setCurrentItem(item)
-        tid = item.data(Qt.ItemDataRole.UserRole)
-        if not tid:
-            return
-        self._select_task_in_table(int(tid))
+        self._show_task_menu(lst.viewport().mapToGlobal(pos))
+
+    def _show_task_menu(self, position):
         menu = QMenu(self)
         menu.addAction("Открыть", self.open_detail_current)
         menu.addAction(self.act_edit_full)
@@ -1514,7 +1721,7 @@ class TodoManager(QMainWindow):
         menu.addAction("В архив", self.archive_task)
         menu.addSeparator()
         menu.addAction(self.act_timer)
-        menu.exec(lst.viewport().mapToGlobal(pos))
+        menu.exec(position)
 
     def delete_task(self):
         tid = self._current_task_id()
@@ -1544,6 +1751,8 @@ class TodoManager(QMainWindow):
         q.prepare("DELETE FROM attachments WHERE task_id=?")
         q.addBindValue(int(tid))
         q.exec()
+        if self.current_detail_task == tid:
+            self._reset_detail()
         self.refresh_view()
 
     def archive_task(self):
@@ -1589,7 +1798,12 @@ class TodoManager(QMainWindow):
                 self._open_full_editor(preset_title=self._get_template_name(tid))
 
     def _open_history_for_current(self):
-        tid = self.current_detail_task or self._current_task_id()
+        self._open_history(self._current_task_id())
+
+    def _open_detail_history(self):
+        self._open_history(self.current_detail_task)
+
+    def _open_history(self, tid):
         if not tid:
             return
         dlg = HistoryDialog(int(tid), self)
@@ -1599,11 +1813,6 @@ class TodoManager(QMainWindow):
         DashboardDialog(self.current_user_id, self).exec()
 
     def _reload_kanban(self):
-        if not hasattr(self, "kanban_lists") or not self.kanban_lists:
-            if hasattr(self, "statusbar"):
-                self.statusbar.showMessage("Kanban: нет колонок")
-            return
-
         for lst in self.kanban_lists.values():
             lst.clear()
 
@@ -1621,12 +1830,8 @@ class TodoManager(QMainWindow):
 
         q = QSqlQuery(sql)
 
-        total = 0
-        added = 0
-
         if q.exec():
             while q.next():
-                total += 1
                 try:
                     tid = int(q.value(0))
                 except Exception:
@@ -1649,47 +1854,32 @@ class TodoManager(QMainWindow):
                     st = "План"
 
                 pr_text = PriorityDelegate.MAP.get(pr, "")
-                line1 = title if len(title) <= 20 else title[:17] + "..."
-                line2 = pr_text
-                if dl:
-                    line2 += f" • {dl}"
-
+                detail = dl or "Без срока"
                 if self._task_has_attachments(tid):
-                    line2 += " • 📎"
-
-                text = f"{line1}\n{line2}"
-
-                it = QListWidgetItem(text)
+                    detail += " · Вложения"
+                it = QListWidgetItem(f"{title}\n{pr_text}\n{detail}")
                 it.setData(Qt.ItemDataRole.UserRole, tid)
-                it.setSizeHint(QSize(0, 50))
+                it.setData(TaskCardDelegate.CONTENT, (title, pr_text, detail, STATUS_TONES[st]))
+                it.setToolTip(f"{title}\n{pr_text}\n{detail}")
+                it.setSizeHint(QSize(0, 78))
+                self.kanban_lists[st].addItem(it)
 
-                lst = self.kanban_lists.get(st)
-                if lst is None:
-                    lst = self.kanban_lists.get("План")
+        for status, label in self.kanban_counts.items():
+            label.setText(str(self.kanban_lists[status].count()))
 
-                if lst is not None:
-                    lst.addItem(it)
-                    added += 1
-
-        if hasattr(self, "statusbar"):
-            self.statusbar.showMessage(
-                f"Kanban: всего задач в выборке: {total}, выведено в колонки: {added}"
-            )
+    def _remember_kanban_list(self, item, _previous=None):
+        if item:
+            self.active_kanban_list = self.sender()
 
     def _open_detail_from_kanban(self, item: QListWidgetItem):
-        tid = item.data(Qt.ItemDataRole.UserRole)
+        tid = self._card_task_id(item)
         if tid:
-            self._select_task_in_table(int(tid))
-            self._open_detail(int(tid))
-            self._show_main_page()
+            self._show_task_in_workspace(tid)
 
-    def _open_detail_from_gallery(self, item: QListWidgetItem):
-        tid = item.data(Qt.ItemDataRole.UserRole)
-        if not tid:
-            return
-        self._select_task_in_table(int(tid))
-        self._open_detail(int(tid))
-        self._show_main_page()
+    def _open_detail_from_gallery(self, item, _previous):
+        tid = self._card_task_id(item)
+        if tid and self.stack.currentWidget() == self.page_main and self.task_views.currentWidget() == self.gallery:
+            self._open_detail(tid)
 
     def _kanban_move_task(self, task_id, new_status):
         q = QSqlQuery()
@@ -1700,10 +1890,12 @@ class TodoManager(QMainWindow):
         q.addBindValue(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         q.addBindValue(int(task_id))
         q.addBindValue(int(self.current_user_id))
-        if q.exec():
-            self._log_history(task_id, "status", "", new_status)
-            if new_status == "Готово":
-                self._spawn_recurring_if_needed(task_id)
+        if not q.exec() or q.numRowsAffected() < 1:
+            return False
+        self._log_history(task_id, "status", "", new_status)
+        if new_status == "Готово":
+            self._spawn_recurring_if_needed(task_id)
+        return True
 
     def export_csv(self):
         path, _ = QFileDialog.getSaveFileName(
@@ -1845,7 +2037,13 @@ class TodoManager(QMainWindow):
     def manage_projects(self):
         dlg = QDialog(self)
         dlg.setWindowTitle("Проекты")
+        dlg.resize(630, 410)
         v = QVBoxLayout(dlg)
+        v.setContentsMargins(20, 18, 20, 16)
+        v.setSpacing(12)
+        title = QLabel("Проекты")
+        title.setObjectName("DialogTitle")
+        v.addWidget(title)
         table = QTableView(dlg)
         pmodel = QSqlTableModel(dlg)
         pmodel.setTable("projects")
@@ -1857,18 +2055,21 @@ class TodoManager(QMainWindow):
         table.setModel(pmodel)
         table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
         table.setAlternatingRowColors(True)
+        table.setShowGrid(False)
         table.horizontalHeader().setStretchLastSection(True)
         table.verticalHeader().setVisible(False)
         v.addWidget(table)
 
         h = QHBoxLayout()
-        add_b = QPushButton("Добавить")
+        add_b = QPushButton(icon("plus", "on_accent"), "Добавить")
+        add_b.setProperty("variant", "primary")
         del_b = QPushButton("Удалить")
         h.addWidget(add_b)
         h.addWidget(del_b)
         h.addStretch(1)
         v.addLayout(h)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok, parent=dlg)
+        bb.button(QDialogButtonBox.StandardButton.Ok).setText("Готово")
         v.addWidget(bb)
         bb.accepted.connect(dlg.accept)
 
@@ -1972,35 +2173,23 @@ class TodoManager(QMainWindow):
                 self._log_history(tid, k, ov, nv)
 
     def _install_hotkeys(self):
-        a_add = QAction(self)
-        a_add.setShortcut("Ctrl+N")
-        a_add.triggered.connect(self.add_task)
-        self.addAction(a_add)
+        for action, shortcut in (
+            (self.act_add, "Ctrl+N"), (self.act_timer, "Ctrl+T"), (self.act_dash, "Ctrl+D"),
+        ):
+            action.setShortcut(shortcut)
+            self.addAction(action)
 
-        a_open = QAction(self)
-        a_open.setShortcut("Enter")
-        a_open.triggered.connect(self.open_detail_current)
-        self.addAction(a_open)
-
-        a_done = QAction(self)
-        a_done.setShortcut("Space")
-        a_done.triggered.connect(self.mark_done)
-        self.addAction(a_done)
-
-        a_del = QAction(self)
-        a_del.setShortcut("Delete")
-        a_del.triggered.connect(self.delete_task)
-        self.addAction(a_del)
-
-        a_timer = QAction(self)
-        a_timer.setShortcut("Ctrl+T")
-        a_timer.triggered.connect(self.toggle_timer)
-        self.addAction(a_timer)
-
-        a_dash = QAction(self)
-        a_dash.setShortcut("Ctrl+D")
-        a_dash.triggered.connect(self._open_dashboard)
-        self.addAction(a_dash)
+        for view in (self.table, self.gallery, *self.kanban_lists.values()):
+            for keys, callback in (
+                (("Return", "Enter"), self.open_detail_current),
+                (("Space",), self.mark_done),
+                (("Delete",), self.delete_task),
+            ):
+                action = QAction(view)
+                action.setShortcuts([QKeySequence(key) for key in keys])
+                action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+                action.triggered.connect(callback)
+                view.addAction(action)
 
         a_kanban = QAction(self)
         a_kanban.setShortcut("Ctrl+B")
@@ -2020,10 +2209,7 @@ class TodoManager(QMainWindow):
         self.lbl_timer.setText(f"Сейчас выполняется задача {num} — 00:00:00")
 
     def toggle_timer(self):
-        if self.stack.currentWidget() in (self.page_main, self.page_kanban):
-            tid = self._current_task_id()
-        else:
-            tid = self.current_detail_task
+        tid = self._current_task_id()
         if not tid:
             return
         tid = int(tid)
@@ -2081,9 +2267,7 @@ class TodoManager(QMainWindow):
     def _open_timer_task_from_panel(self):
         if not self.timer_task_id:
             return
-        self._select_task_in_table(int(self.timer_task_id))
-        self._open_detail(int(self.timer_task_id))
-        self._show_main_page()
+        self._show_task_in_workspace(int(self.timer_task_id))
 
     def _spawn_recurring_if_needed(self, task_id):
         q = QSqlQuery()
@@ -2232,16 +2416,31 @@ class TodoManager(QMainWindow):
     def _open_settings(self):
         dlg = SettingsDialog(self.settings, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            fs = self.settings.value("ui/font_size", 14, int)
-            f = self.font()
-            f.setPointSize(fs)
-            QApplication.instance().setFont(f)
-
-            compact = self.settings.value("ui/compact_table", False, bool)
-            vh = self.table.verticalHeader()
-            vh.setDefaultSectionSize(22 if compact else 28)
-
+            self._apply_view_settings()
             self.refresh_view()
+
+    def _apply_view_settings(self):
+        app = QApplication.instance()
+        size = self.settings.value("ui/font_size", 14, int)
+        size = max(10, min(24, size))
+        if size != app.font().pixelSize():
+            set_interface_size(app, size)
+        metrics = self.table.fontMetrics()
+        self.left_nav.setFixedWidth(max(194, metrics.horizontalAdvance(self.act_logout.text()) + 65))
+        header = self.table.horizontalHeader()
+        for column, text, minimum in (
+            (3, "Отложено", 94), (5, "2026-01-01", 100),
+            (4, "Критический", 105), (8, "Проект", 95),
+        ):
+            width = max(minimum, metrics.horizontalAdvance(text) + 23)
+            self.table_column_widths[column] = width
+            header.resizeSection(column, width)
+        self._hide_internal_columns()
+        compact = self.settings.value("ui/compact_table", False, bool)
+        text_height = max(14, metrics.height())
+        self.table.verticalHeader().setDefaultSectionSize(
+            text_height + (14 if compact else 27)
+        )
 
     def _update_statusbar_stats(self):
         if not hasattr(self, "statusbar") or not self.current_user_id:
@@ -2271,13 +2470,14 @@ class TodoManager(QMainWindow):
         if q.exec() and q.next():
             over = int(q.value(0) or 0)
 
-        self.statusbar.showMessage(f"Всего: {total} | Открыто: {open_count} | Просрочено: {over}")
+        self.statusbar.showMessage(f"Всего: {total}   ·   Открыто: {open_count}   ·   Просрочено: {over}")
 
     def logout(self):
         if self.timer_task_id is not None:
             self._stop_timer()
 
         self.hide()
+        self._reset_detail()
         self.current_user_id = None
         if not self._authenticate():
             QApplication.instance().quit()

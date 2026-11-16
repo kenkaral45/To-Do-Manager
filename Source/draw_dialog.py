@@ -11,6 +11,11 @@ class DrawDialog(QDialog):
         self.resize(1000, 650)
 
         v_lay = QVBoxLayout(self)
+        v_lay.setContentsMargins(18, 16, 18, 14)
+        v_lay.setSpacing(10)
+        heading = QLabel("Рукописная заметка")
+        heading.setObjectName("DialogTitle")
+        v_lay.addWidget(heading)
         tb = QToolBar(self)
         v_lay.addWidget(tb)
 
@@ -46,6 +51,7 @@ class DrawDialog(QDialog):
         v_lay.addLayout(bottom)
         bottom.addStretch(1)
         self.btn_ok = QPushButton("Сохранить")
+        self.btn_ok.setProperty("variant", "primary")
         self.btn_cancel = QPushButton("Отмена")
         bottom.addWidget(self.btn_ok)
         bottom.addWidget(self.btn_cancel)

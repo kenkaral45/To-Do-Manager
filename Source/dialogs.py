@@ -1,7 +1,7 @@
 from hashlib import sha256
 from datetime import datetime
 
-from PyQt6.QtCore import Qt, QSettings
+from PyQt6.QtCore import QSize, Qt, QSettings
 from PyQt6.QtSql import QSqlQuery
 from PyQt6.QtWidgets import (
     QDialog,
@@ -19,27 +19,69 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QWidget,
     QTabWidget,
+    QFrame,
+    QGridLayout,
 )
+from style import icon, set_primary
+
+
+def _dialog_layout(dialog):
+    layout = QVBoxLayout(dialog)
+    layout.setContentsMargins(20, 18, 20, 16)
+    layout.setSpacing(12)
+    title = QLabel(dialog.windowTitle())
+    title.setObjectName("DialogTitle")
+    layout.addWidget(title)
+    return layout
 
 
 class LoginDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Вход / Регистрация")
+        self.setObjectName("LoginWindow")
+        self.resize(416, 322)
 
         lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 23, 24, 22)
+        lay.setSpacing(11)
+
+        brand = QHBoxLayout()
+        brand.setSpacing(9)
+        mark = QLabel()
+        mark.setObjectName("BrandMark")
+        mark.setFixedSize(34, 34)
+        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        mark.setPixmap(icon("mark", "accent_hover").pixmap(QSize(23, 23)))
+        name = QLabel("To-Do Manager")
+        name.setObjectName("BrandTitle")
+        brand.addWidget(mark)
+        brand.addWidget(name, 1)
+        lay.addLayout(brand)
+
+        title = QLabel("Вход")
+        title.setObjectName("DialogTitle")
+        lay.addWidget(title)
 
         self.username = QLineEdit()
         self.password = QLineEdit()
         self.password.setEchoMode(QLineEdit.EchoMode.Password)
 
-        lay.addWidget(QLabel("Логин"))
+        username = QLabel("Логин")
+        username.setBuddy(self.username)
+        lay.addWidget(username)
         lay.addWidget(self.username)
-        lay.addWidget(QLabel("Пароль"))
+        password = QLabel("Пароль")
+        password.setBuddy(self.password)
+        lay.addWidget(password)
         lay.addWidget(self.password)
+        lay.addStretch(1)
 
-        b1 = QPushButton("Вход")
-        b2 = QPushButton("Регистрация")
+        b1 = QPushButton("Войти")
+        b1.setProperty("variant", "primary")
+        b1.setDefault(True)
+        b2 = QPushButton("Создать аккаунт")
+        b2.setAutoDefault(False)
         h = QHBoxLayout()
         h.addWidget(b1)
         h.addWidget(b2)
@@ -89,11 +131,12 @@ class HistoryDialog(QDialog):
         self.setWindowTitle("История изменений")
         self.resize(650, 420)
 
-        v = QVBoxLayout(self)
+        v = _dialog_layout(self)
         self.list = QListWidget(self)
         v.addWidget(self.list)
 
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=self)
+        bb.button(QDialogButtonBox.StandardButton.Close).setText("Закрыть")
         v.addWidget(bb)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
@@ -121,14 +164,16 @@ class TemplatesDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Шаблоны задач")
+        self.resize(480, 360)
 
-        v = QVBoxLayout(self)
+        v = _dialog_layout(self)
         self.list = QListWidget(self)
         v.addWidget(self.list)
 
         hb = QHBoxLayout()
         self.add_b = QPushButton("Добавить")
         self.apply_b = QPushButton("Применить")
+        self.apply_b.setProperty("variant", "primary")
         self.del_b = QPushButton("Удалить")
         hb.addWidget(self.add_b)
         hb.addWidget(self.apply_b)
@@ -137,6 +182,7 @@ class TemplatesDialog(QDialog):
         v.addLayout(hb)
 
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=self)
+        bb.button(QDialogButtonBox.StandardButton.Close).setText("Закрыть")
         v.addWidget(bb)
         bb.rejected.connect(self.reject)
         bb.accepted.connect(self.accept)
@@ -187,21 +233,44 @@ class DashboardDialog(QDialog):
         super().__init__(parent)
         self.user_id = int(user_id)
         self.setWindowTitle("Статистика")
+        self.resize(490, 380)
 
-        v = QVBoxLayout(self)
+        v = _dialog_layout(self)
         self.l_total = QLabel()
         self.l_done = QLabel()
         self.l_over = QLabel()
         self.l_time = QLabel()
         self.l_by_proj = QLabel()
-        v.addWidget(self.l_total)
-        v.addWidget(self.l_done)
-        v.addWidget(self.l_over)
-        v.addWidget(self.l_time)
-        v.addWidget(QLabel("По проектам:"))
+        self.l_by_proj.setTextFormat(Qt.TextFormat.PlainText)
+        surface = QFrame()
+        surface.setProperty("surface", "glass")
+        grid = QGridLayout(surface)
+        grid.setContentsMargins(16, 13, 16, 13)
+        grid.setVerticalSpacing(12)
+        for i, (caption, value, tone) in enumerate((
+            ("Всего задач", self.l_total, "accent"),
+            ("Выполнено", self.l_done, "teal"),
+            ("Просрочено", self.l_over, "rose"),
+            ("Время по таймеру", self.l_time, "amber"),
+        )):
+            metric = QVBoxLayout()
+            metric.setSpacing(1)
+            label = QLabel(caption)
+            label.setObjectName("MetricLabel")
+            value.setObjectName("MetricValue")
+            value.setProperty("tone", tone)
+            metric.addWidget(label)
+            metric.addWidget(value)
+            grid.addLayout(metric, i // 2, i % 2)
+        v.addWidget(surface)
+        projects = QLabel("По проектам")
+        projects.setObjectName("SectionTitle")
+        v.addWidget(projects)
         v.addWidget(self.l_by_proj)
+        v.addStretch(1)
 
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok, parent=self)
+        bb.button(QDialogButtonBox.StandardButton.Ok).setText("Закрыть")
         v.addWidget(bb)
         bb.accepted.connect(self.accept)
 
@@ -256,10 +325,10 @@ class DashboardDialog(QDialog):
             while q.next():
                 by_proj.append(f"{q.value(0)}: {q.value(1)}")
 
-        self.l_total.setText(f"Открытых задач: {total}")
-        self.l_done.setText(f"Выполнено: {done}")
-        self.l_over.setText(f"Просрочено: {over}")
-        self.l_time.setText(f"Накопленное время: {hours} ч {mins} мин")
+        self.l_total.setText(str(total))
+        self.l_done.setText(str(done))
+        self.l_over.setText(str(over))
+        self.l_time.setText(f"{hours} ч {mins:02d} мин" if hours else f"{mins} мин")
         self.l_by_proj.setText("\n".join(by_proj) if by_proj else "—")
 
 
@@ -270,18 +339,21 @@ class SettingsDialog(QDialog):
         self.settings = settings
         self.resize(500, 400)
 
-        v = QVBoxLayout(self)
+        v = _dialog_layout(self)
         tabs = QTabWidget(self)
         v.addWidget(tabs)
 
         view_page = QWidget()
         vl = QVBoxLayout(view_page)
+        vl.setContentsMargins(12, 12, 12, 12)
 
         self.font_size_spin = QSpinBox()
         self.font_size_spin.setRange(10, 24)
         self.font_size_spin.setValue(self.settings.value("ui/font_size", 14, int))
-        vl.addWidget(QLabel("Размер шрифта интерфейса"))
-        vl.addWidget(self.font_size_spin)
+        font_size = QLabel("Размер шрифта интерфейса")
+        font_size.setBuddy(self.font_size_spin)
+        vl.addWidget(font_size)
+        vl.addWidget(self.font_size_spin, 0, Qt.AlignmentFlag.AlignLeft)
 
         self.compact_table = QCheckBox("Компактная таблица")
         self.compact_table.setChecked(
@@ -293,6 +365,7 @@ class SettingsDialog(QDialog):
 
         beh_page = QWidget()
         bl = QVBoxLayout(beh_page)
+        bl.setContentsMargins(12, 12, 12, 12)
 
         self.auto_kanban = QCheckBox("Открывать Канбан при запуске")
         self.auto_kanban.setChecked(
@@ -317,6 +390,9 @@ class SettingsDialog(QDialog):
             | QDialogButtonBox.StandardButton.Cancel,
             parent=self,
         )
+        bb.button(QDialogButtonBox.StandardButton.Ok).setText("Сохранить")
+        set_primary(bb.button(QDialogButtonBox.StandardButton.Ok))
+        bb.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
         v.addWidget(bb)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)

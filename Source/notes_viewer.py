@@ -1,7 +1,7 @@
 # notes_viewer.py
 from PyQt6.QtCore import Qt, QSize
 from PyQt6.QtGui import QImage, QPainter, QPixmap
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem, QLabel
+from PyQt6.QtWidgets import QLabel, QListWidget, QListWidgetItem, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget
 
 try:
     from PyQt6.QtSvgWidgets import QSvgWidget
@@ -21,43 +21,39 @@ class NotesPreview(QWidget):
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(6)
 
-        h = QHBoxLayout()
-        self.list = QListWidget(self)
-        self.list.setMinimumWidth(220)
-        self.list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
-        h.addWidget(self.list)
+        title = QLabel("Рисунки и изображения")
+        title.setObjectName("SectionTitle")
+        v.addWidget(title)
 
+        self.list = QListWidget(self)
+        self.list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.list.setAccessibleName(title.text())
+        self.list.setMaximumHeight(76)
+        v.addWidget(self.list)
+
+        self.views = QStackedWidget()
+        self.views.setFixedHeight(160)
+        self.preview_png = QLabel()
+        self.preview_png.setObjectName("DrawingPreview")
+        self.preview_png.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self.preview_png.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.views.addWidget(self.preview_png)
         self.preview_svg = QSvgWidget() if QSvgWidget is not None else None
         if self.preview_svg is not None:
-            self.preview_svg.setMinimumHeight(180)
-            self.preview_svg.setStyleSheet("border:1px solid #333;border-radius:10px;")
-            h.addWidget(self.preview_svg, 1)
-            self.preview_png = None
-        else:
-            self.preview_png = QLabel(self)
-            self.preview_png.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.preview_png.setMinimumHeight(180)
-            self.preview_png.setStyleSheet("border:1px solid #333;border-radius:10px;")
-            h.addWidget(self.preview_png, 1)
-            self.preview_svg = None
-
-        v.addLayout(h, 1)
+            self.views.addWidget(self.preview_svg)
+        v.addWidget(self.views)
 
         self.list.currentItemChanged.connect(self._on_item)
-
-        self._task_id = None
-        self._items = []
+        self.hide()
 
     def load_for_task(self, task_id: int):
         from PyQt6.QtSql import QSqlQuery
-        self._task_id = int(task_id)
         self.list.clear()
         self._clear_preview()
-        self._items.clear()
 
         q = QSqlQuery()
         q.prepare("SELECT id, name, path FROM attachments WHERE task_id=? ORDER BY id")
-        q.addBindValue(self._task_id)
+        q.addBindValue(int(task_id))
         if q.exec():
             while q.next():
                 aid = int(q.value(0))
@@ -69,8 +65,7 @@ class NotesPreview(QWidget):
                     it.setData(Qt.ItemDataRole.UserRole, (aid, path))
                     it.setSizeHint(QSize(0, 28))
                     self.list.addItem(it)
-                    self._items.append((aid, path))
-
+        self.setVisible(self.list.count() > 0)
         if self.list.count() > 0:
             self.list.setCurrentRow(0)
 
@@ -82,31 +77,32 @@ class NotesPreview(QWidget):
         self._render(path)
 
     def _clear_preview(self):
-        if self.preview_svg is not None:
-            self.preview_svg.load(b"")
-        if self.preview_png is not None:
-            self.preview_png.clear()
+        self.views.setCurrentWidget(self.preview_png)
+        self.preview_png.clear()
 
     def _render(self, path: str):
         low = path.lower()
         if low.endswith(".png"):
-            if self.preview_png is None:
-                pass
             pm = QPixmap(path)
-            if not pm.isNull() and self.preview_png is not None:
-                target = self.preview_png.size() - QSize(16, 16)
+            self.views.setCurrentWidget(self.preview_png)
+            if not pm.isNull():
+                target = QSize(self.width(), self.views.height()) - QSize(16, 16)
                 self.preview_png.setPixmap(pm.scaled(
                     target if target.width() > 0 and target.height() > 0 else pm.size(),
                     Qt.AspectRatioMode.KeepAspectRatio,
                     Qt.TransformationMode.SmoothTransformation
                 ))
+            else:
+                self.preview_png.setText("Изображение недоступно")
             return
 
         if low.endswith(".svg") and self.preview_svg is not None:
             self.preview_svg.load(path)
-            return
+            if self.preview_svg.renderer().isValid():
+                self.views.setCurrentWidget(self.preview_svg)
+                return
 
-        if low.endswith(".svg") and QSvgRenderer is not None and self.preview_png is not None:
+        if low.endswith(".svg") and self.preview_svg is None and QSvgRenderer is not None:
             svg = QSvgRenderer(path)
             if svg.isValid():
                 w = max(800, self.width())
@@ -123,3 +119,12 @@ class NotesPreview(QWidget):
                     Qt.AspectRatioMode.KeepAspectRatio,
                     Qt.TransformationMode.SmoothTransformation
                 ))
+                return
+
+        self.views.setCurrentWidget(self.preview_png)
+        self.preview_png.setText("Изображение недоступно")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if event.oldSize().width() != event.size().width() and self.list.currentItem():
+            self._on_item(self.list.currentItem(), None)

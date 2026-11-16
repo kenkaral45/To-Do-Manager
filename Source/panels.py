@@ -1,4 +1,4 @@
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QTimer, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -17,17 +17,24 @@ class SubtasksPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         v = QVBoxLayout(self)
-        v.addWidget(QLabel("Подзадачи"))
+        v.setContentsMargins(0, 6, 0, 0)
+        v.setSpacing(6)
+        title = QLabel("Подзадачи")
+        title.setObjectName("SectionTitle")
+        v.addWidget(title)
 
         self.list = QListWidget(self)
         self.list.setObjectName("SubtaskList")
+        self.list.setAccessibleName(title.text())
+        self.list.setMaximumHeight(107)
         self.list.setItemDelegate(SubtaskDelegate(self.list))
         v.addWidget(self.list)
 
         hb = QHBoxLayout()
         self.add_b = QPushButton("Добавить")
         self.del_b = QPushButton("Удалить")
-        self.toggle_b = QPushButton("Переключить")
+        self.toggle_b = QPushButton("Статус")
+        self.toggle_b.setToolTip("Переключить статус выбранной подзадачи")
         hb.addWidget(self.add_b)
         hb.addWidget(self.del_b)
         hb.addWidget(self.toggle_b)
@@ -40,9 +47,15 @@ class AttachmentsPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         v = QVBoxLayout(self)
-        v.addWidget(QLabel("Вложения"))
+        v.setContentsMargins(0, 6, 0, 0)
+        v.setSpacing(6)
+        title = QLabel("Вложения")
+        title.setObjectName("SectionTitle")
+        v.addWidget(title)
 
         self.list = QListWidget(self)
+        self.list.setAccessibleName(title.text())
+        self.list.setMaximumHeight(107)
         v.addWidget(self.list)
 
         hb = QHBoxLayout()
@@ -123,12 +136,17 @@ class KanbanListWidget(QListWidget):
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
 
     def dropEvent(self, event):
-        super().dropEvent(event)
+        source = event.source()
+        if not isinstance(source, KanbanListWidget) or source.manager is not self.manager or source is self:
+            event.ignore()
+            return
+        item = source.currentItem()
+        task_id = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if not task_id or not self.manager._kanban_move_task(int(task_id), self.status):
+            event.ignore()
+            return
 
-        for it in self.selectedItems():
-            tid = it.data(Qt.ItemDataRole.UserRole)
-            if tid:
-                self.manager._kanban_move_task(int(tid), self.status)
-
-        self.manager._reload_kanban()
-        self.manager.refresh_view()
+        # The SQL model supplies both columns after the drop.
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+        QTimer.singleShot(0, self.manager.refresh_view)
